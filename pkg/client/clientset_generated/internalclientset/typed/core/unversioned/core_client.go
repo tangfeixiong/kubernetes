@@ -39,6 +39,8 @@ type CoreInterface interface {
 	SecretsGetter
 	ServicesGetter
 	ServiceAccountsGetter
+
+        SecurityContextConstraintsGetter
 }
 
 // CoreClient is used to interact with features provided by the Core group.

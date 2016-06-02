@@ -50,6 +50,12 @@ type Interface interface {
 	Discovery() discovery.DiscoveryInterface
 }
 
+
+func (c *Client) SecurityContextConstraints() SecurityContextConstraintInterface {
+	return newSecurityContextConstraints(c)
+}
+
+
 func (c *Client) ReplicationControllers(namespace string) ReplicationControllerInterface {
 	return newReplicationControllers(c, namespace)
 }

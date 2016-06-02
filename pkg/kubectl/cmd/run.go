@@ -69,6 +69,202 @@ kubectl run nginx --image=nginx --command -- <cmd> <arg1> ... <argN>
 kubectl run pi --image=perl --restart=OnFailure -- perl -Mbignum=bpi -wle 'print bpi(2000)'`
 )
 
+type RunOptions struct {
+	DefaultRestartAlwaysGenerator string
+	DefaultGenerator              string
+}
+
+func NewCmdRunWithOptions(f *cmdutil.Factory, opts *RunOptions, cmdIn io.Reader, cmdOut, cmdErr io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use: "run NAME --image=image [--env=\"key=value\"] [--port=port] [--replicas=replicas] [--dry-run=bool] [--overrides=inline-json] [--command] -- [COMMAND] [args...]",
+		// run-container is deprecated
+		Aliases: []string{"run-container"},
+		Short:   "Run a particular image on the cluster.",
+		Long:    run_long,
+		Example: run_example,
+		Run: func(cmd *cobra.Command, args []string) {
+			argsLenAtDash := cmd.ArgsLenAtDash()
+			err := RunWithOptions(f, opts, cmdIn, cmdOut, cmdErr, cmd, args, argsLenAtDash)
+			cmdutil.CheckErr(err)
+		},
+	}
+	cmdutil.AddPrinterFlags(cmd)
+	addRunFlags(cmd)
+	cmdutil.AddApplyAnnotationFlags(cmd)
+	cmdutil.AddRecordFlag(cmd)
+	cmdutil.AddInclude3rdPartyFlags(cmd)
+	return cmd
+}
+
+func RunWithOptions(f *cmdutil.Factory, opts *RunOptions, cmdIn io.Reader, cmdOut, cmdErr io.Writer, cmd *cobra.Command, args []string, argsLenAtDash int) error {
+	if len(os.Args) > 1 && os.Args[1] == "run-container" {
+		printDeprecationWarning("run", "run-container")
+	}
+
+	// Let kubectl run follow rules for `--`, see #13004 issue
+	if len(args) == 0 || argsLenAtDash == 0 {
+		return cmdutil.UsageError(cmd, "NAME is required for run")
+	}
+
+	interactive := cmdutil.GetFlagBool(cmd, "stdin")
+	tty := cmdutil.GetFlagBool(cmd, "tty")
+	if tty && !interactive {
+		return cmdutil.UsageError(cmd, "-i/--stdin is required for containers with --tty=true")
+	}
+	replicas := cmdutil.GetFlagInt(cmd, "replicas")
+	if interactive && replicas != 1 {
+		return cmdutil.UsageError(cmd, fmt.Sprintf("-i/--stdin requires that replicas is 1, found %d", replicas))
+	}
+
+	namespace, _, err := f.DefaultNamespace()
+	if err != nil {
+		return err
+	}
+	restartPolicy, err := getRestartPolicy(cmd, interactive)
+	if err != nil {
+		return err
+	}
+	if restartPolicy != api.RestartPolicyAlways && replicas != 1 {
+		return cmdutil.UsageError(cmd, fmt.Sprintf("--restart=%s requires that --replicas=1, found %d", restartPolicy, replicas))
+	}
+
+	generatorName := cmdutil.GetFlagString(cmd, "generator")
+	if len(generatorName) == 0 && opts != nil {
+		switch {
+		case restartPolicy == api.RestartPolicyAlways:
+			generatorName = opts.DefaultRestartAlwaysGenerator
+		default:
+			generatorName = opts.DefaultGenerator
+		}
+	}
+	if len(generatorName) == 0 {
+		client, err := f.Client()
+		if err != nil {
+			return err
+		}
+		resourcesList, err := client.Discovery().ServerResources()
+		if err != nil {
+			// this cover the cases where old servers do not expose discovery
+			resourcesList = nil
+		}
+		if restartPolicy == api.RestartPolicyAlways {
+			if contains(resourcesList, v1beta1.SchemeGroupVersion.WithResource("deployments")) {
+				generatorName = "deployment/v1beta1"
+			} else {
+				generatorName = "run/v1"
+			}
+		} else {
+			if contains(resourcesList, batchv1.SchemeGroupVersion.WithResource("jobs")) {
+				generatorName = "job/v1"
+			} else if contains(resourcesList, v1beta1.SchemeGroupVersion.WithResource("jobs")) {
+				generatorName = "job/v1beta1"
+			} else {
+				generatorName = "run-pod/v1"
+			}
+		}
+	}
+	generators := f.Generators("run")
+	generator, found := generators[generatorName]
+	if !found {
+		return cmdutil.UsageError(cmd, fmt.Sprintf("generator %q not found.", generatorName))
+	}
+	names := generator.ParamNames()
+	params := kubectl.MakeParams(cmd, names)
+	params["name"] = args[0]
+	if len(args) > 1 {
+		params["args"] = args[1:]
+	}
+
+	params["env"] = cmdutil.GetFlagStringSlice(cmd, "env")
+
+	obj, _, mapper, mapping, err := createGeneratedObject(f, cmd, generator, names, params, cmdutil.GetFlagString(cmd, "overrides"), namespace)
+	if err != nil {
+		return err
+	}
+
+	if cmdutil.GetFlagBool(cmd, "expose") {
+		serviceGenerator := cmdutil.GetFlagString(cmd, "service-generator")
+		if len(serviceGenerator) == 0 {
+			return cmdutil.UsageError(cmd, fmt.Sprintf("No service generator specified"))
+		}
+		if err := generateService(f, cmd, args, serviceGenerator, params, namespace, cmdOut); err != nil {
+			return err
+		}
+	}
+
+	attachFlag := cmd.Flags().Lookup("attach")
+	attach := cmdutil.GetFlagBool(cmd, "attach")
+
+	if !attachFlag.Changed && interactive {
+		attach = true
+	}
+
+	remove := cmdutil.GetFlagBool(cmd, "rm")
+	if !attach && remove {
+		return cmdutil.UsageError(cmd, "--rm should only be used for attached containers")
+	}
+
+	if attach {
+		opts := &AttachOptions{
+			In:    cmdIn,
+			Out:   cmdOut,
+			Err:   cmdErr,
+			Stdin: interactive,
+			TTY:   tty,
+
+			Attach: &DefaultRemoteAttach{},
+		}
+		config, err := f.ClientConfig()
+		if err != nil {
+			return err
+		}
+		opts.Config = config
+
+		client, err := f.Client()
+		if err != nil {
+			return err
+		}
+		opts.Client = client
+
+		attachablePod, err := f.AttachablePodForObject(obj)
+		if err != nil {
+			return err
+		}
+		err = handleAttachPod(f, client, attachablePod, opts)
+		if err != nil {
+			return err
+		}
+
+		if remove {
+			namespace, err = mapping.MetadataAccessor.Namespace(obj)
+			if err != nil {
+				return err
+			}
+			var name string
+			name, err = mapping.MetadataAccessor.Name(obj)
+			if err != nil {
+				return err
+			}
+			_, typer := f.Object(cmdutil.GetIncludeThirdPartyAPIs(cmd))
+			r := resource.NewBuilder(mapper, typer, resource.ClientMapperFunc(f.ClientForMapping), f.Decoder(true)).
+				ContinueOnError().
+				NamespaceParam(namespace).DefaultNamespace().
+				ResourceNames(mapping.Resource, name).
+				Flatten().
+				Do()
+			return ReapResult(r, f, cmdOut, true, true, 0, -1, false, mapper)
+		}
+		return nil
+	}
+
+	outputFormat := cmdutil.GetFlagString(cmd, "output")
+	if outputFormat != "" {
+		return f.PrintObject(cmd, mapper, obj, cmdOut)
+	}
+	cmdutil.PrintSuccess(mapper, false, cmdOut, mapping.Resource, args[0], "created")
+	return nil
+}
+
 func NewCmdRun(f *cmdutil.Factory, cmdIn io.Reader, cmdOut, cmdErr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use: "run NAME --image=image [--env=\"key=value\"] [--port=port] [--replicas=replicas] [--dry-run=bool] [--overrides=inline-json] [--command] -- [COMMAND] [args...]",
