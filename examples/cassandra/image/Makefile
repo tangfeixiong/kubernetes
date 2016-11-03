@@ -16,6 +16,8 @@
 
 VERSION=v8
 
+TAG=$(VERSION)-$(shell date +%y%m%d%H%M)-gitrev-$(shell git rev-parse --short=7 HEAD)
+
 all: build
 
 kubernetes-cassandra.jar: ../java/* ../java/src/io/k8s/cassandra/*.java
@@ -28,5 +30,9 @@ build: kubernetes-cassandra.jar
 
 push: build
 	gcloud docker push gcr.io/google_samples/cassandra:${VERSION}
+
+.PHONY: vendor-docker-image
+vendor-docker-image:
+	docker build -t tangfeixiong/cassandra:${TAG} .
 
 .PHONY: all build push
